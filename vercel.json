@@ -1,9 +1,18 @@
 {
+  "version": 2,
   "rootDirectory": "client",
+  "builds": [
+    { "src": "client/package.json", "use": "@vercel/next" },
+    { "src": "server/src/server.ts", "use": "@vercel/node" }
+  ],
   "rewrites": [
     {
-      "source": "/api/:path*",
-      "destination": "/api/:path*"
+      "source": "/api/(.*)",
+      "destination": "/server/src/server.ts"
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/client/$1"
     }
   ]
 }
