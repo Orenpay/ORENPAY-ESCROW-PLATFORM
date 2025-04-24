@@ -1,3 +1,9 @@
 {
-  "rootDirectory": "client"
+  "rootDirectory": "client",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/:path*"
+    }
+  ]
 }
