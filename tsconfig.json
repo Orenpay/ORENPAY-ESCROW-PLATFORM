@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2016",
+    "module": "CommonJS",
+    "outDir": "./dist", // Changed output directory
+    "rootDir": ".", // Changed root directory to project root
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true, // Keep this? Might cause issues if types aren't separate
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./server/*"] // Keep path alias relative to baseUrl
+    }
+  },
+  // Updated include to cover both server and config
+  "include": ["server/**/*.ts", "config/**/*.ts"], 
+  "exclude": ["node_modules", "dist", "client"]
+}
