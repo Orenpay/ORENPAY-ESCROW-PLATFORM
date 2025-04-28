@@ -1,8 +1,16 @@
 import { Request, Response } from 'express';
-import { createOrder, findOrderById, updateOrderStatus, findOrdersByUserId, OrderStatus, findTransactionsByOrderId } from '../models/Order';
-import { createTransaction, updateTransactionDetails } from '../models/Transaction';
-import { findUserById } from '../models/User';
+// Import Order type and remove findTransactionsByOrderId from here
+import { createOrder, findOrderById, updateOrderStatus, findOrdersByUserId, OrderStatus, Order } from '../models/Order';
+// Import findTransactionsByOrderId from Transaction model
+import { createTransaction, updateTransactionDetails, findTransactionsByOrderId } from '../models/Transaction';
+// Import the new function and existing ones
+import { findUserById, findUserByEmailOrPhone } from '../models/User';
 import { initiateStkPush } from '../services/mpesa';
+import { initiatePesapalPayment } from '../services/pesapal'; // Import Pesapal service
+import { initiateTkashPayment } from '../services/tkash'; // Import T-Kash service
+import { initiateIpayPayment } from '../services/ipay'; // Import iPay service
+import { initiateDpoPayment } from '../services/dpo'; // Import DPO service
+import { initiateJambopayPayment } from '../services/jambopay'; // Import JamboPay service
 import { sendSmsNotification } from '../services/notificationService'; // Import notification service
 
 /**
@@ -11,22 +19,27 @@ import { sendSmsNotification } from '../services/notificationService'; // Import
  */
 export const createNewOrder = async (req: Request, res: Response): Promise<void> => {
     const buyer = req.user!;
-    const { seller_id, item_description, amount, payment_method } = req.body;
+    // Expect sellerIdentifier (email/phone) instead of seller_id
+    const { sellerIdentifier, item_description, amount, payment_method } = req.body;
 
-    if (!seller_id || !item_description || !amount || !payment_method) {
-        res.status(400).json({ message: 'Seller ID, item description, amount, and payment method are required.' });
+    // Validate required fields
+    if (!sellerIdentifier || !item_description || !amount || !payment_method) {
+        res.status(400).json({ message: 'Seller identifier (email/phone), item description, amount, and payment method are required.' });
         return;
     }
 
-    const supportedPaymentMethods = ['mpesa', 'airtel', 'equity'];
+    const supportedPaymentMethods = [
+        'mpesa', 
+        'airtel', 
+        'equity', 
+        'pesapal', 
+        'tkash', 
+        'ipay', 
+        'dpo', 
+        'jambopay'
+    ]; // Added new methods
     if (!supportedPaymentMethods.includes(payment_method.toLowerCase())) {
         res.status(400).json({ message: `Unsupported payment method: ${payment_method}` });
-        return;
-    }
-
-    const buyerDetails = await findUserById(buyer.id!);
-    if (!buyerDetails || !buyerDetails.phone_number) {
-        res.status(400).json({ message: 'Buyer phone number is required for this payment method and is missing.' });
         return;
     }
 
@@ -34,9 +47,36 @@ export const createNewOrder = async (req: Request, res: Response): Promise<void>
     let initialTransaction;
 
     try {
+        // Find the seller by email or phone number
+        const seller = await findUserByEmailOrPhone(sellerIdentifier);
+        if (!seller || !seller.id) {
+            res.status(404).json({ message: `Seller not found with identifier: ${sellerIdentifier}` });
+            return;
+        }
+        // Ensure seller is actually a seller or business
+        if (seller.role !== 'seller' && seller.role !== 'business') {
+            res.status(400).json({ message: `The user found with identifier ${sellerIdentifier} is not registered as a seller or business.` });
+            return;
+        }
+
+        const seller_id = seller.id; // Get the seller's ID
+
+        const buyerDetails = await findUserById(buyer.id!);
+        if (!buyerDetails) {
+            // This shouldn't happen if the user is authenticated, but good practice to check
+            res.status(404).json({ message: 'Buyer details not found.' });
+            return;
+        }
+
+        // Check for buyer phone number only if needed (M-Pesa)
+        if (payment_method.toLowerCase() === 'mpesa' && !buyerDetails.phone_number) {
+            res.status(400).json({ message: 'Your phone number is required for M-Pesa payment. Please update your profile.' });
+            return;
+        }
+
         const orderInput = {
             buyer_id: buyer.id!,
-            seller_id,
+            seller_id, // Use the found seller_id
             item_description,
             amount,
             payment_method
@@ -58,6 +98,9 @@ export const createNewOrder = async (req: Request, res: Response): Promise<void>
         console.log(`Initiating ${payment_method} payment for order ${newOrder.id} amount ${amount}...`);
         switch (payment_method.toLowerCase()) {
             case 'mpesa':
+                if (!buyerDetails?.phone_number) { // Re-check just before calling M-Pesa
+                    throw new Error('Buyer phone number is missing for M-Pesa initiation.');
+                }
                 paymentInitiationResult = await initiateStkPush(newOrder.id!, buyerDetails.phone_number, amount);
                 initiationDetails.provider_ref = paymentInitiationResult?.CheckoutRequestID;
                 initiationDetails.description = `M-Pesa STK Push initiated. CheckoutRequestID: ${initiationDetails.provider_ref || 'N/A'}`;
@@ -70,15 +113,100 @@ export const createNewOrder = async (req: Request, res: Response): Promise<void>
                 console.warn('Equity payment initiation not implemented yet.');
                 initiationDetails.description = 'Equity payment initiation requested (not implemented).';
                 break;
+            case 'pesapal':
+                const pesapalResult = await initiatePesapalPayment(newOrder, buyerDetails);
+                if (pesapalResult.redirectUrl) {
+                    initiationDetails.description = `Pesapal payment initiated. Redirect user to payment page.`;
+                    res.status(201).json({
+                        order: newOrder,
+                        payment_status: 'pending_redirect',
+                        transaction_id: initialTransaction.id,
+                        redirectUrl: pesapalResult.redirectUrl
+                    });
+                    return; 
+                } else {
+                    throw new Error(pesapalResult.errorMessage || 'Pesapal initiation failed.');
+                }
+            case 'tkash':
+                if (!buyerDetails?.phone_number) {
+                    throw new Error('Buyer phone number is missing for T-Kash initiation.');
+                }
+                const tkashResult = await initiateTkashPayment(newOrder, buyerDetails);
+                if (tkashResult.errorMessage) {
+                    throw new Error(tkashResult.errorMessage);
+                }
+                initiationDetails.provider_ref = tkashResult.provider_ref;
+                initiationDetails.description = tkashResult.description || 'T-Kash STK Push initiated.';
+                break;
+            case 'ipay':
+                const ipayResult = await initiateIpayPayment(newOrder, buyerDetails);
+                if (ipayResult.redirectUrl) { // If iPay returns a direct redirect URL
+                    initiationDetails.description = `iPay payment initiated. Redirect user to payment page.`;
+                    res.status(201).json({
+                        order: newOrder,
+                        payment_status: 'pending_redirect',
+                        transaction_id: initialTransaction.id,
+                        redirectUrl: ipayResult.redirectUrl
+                    });
+                    return;
+                } else if (ipayResult.formData) { // If iPay requires form POST from frontend
+                     initiationDetails.description = `iPay payment initiated. Awaiting frontend POST.`;
+                     res.status(201).json({
+                        order: newOrder,
+                        payment_status: 'pending_form_post', // Custom status for frontend
+                        transaction_id: initialTransaction.id,
+                        formData: ipayResult.formData, // Send form data to frontend
+                        ipayPostUrl: 'https://payments.ipayafrica.com/v3/ke' // TODO: Confirm iPay POST URL
+                    });
+                    return;
+                } else {
+                    throw new Error(ipayResult.errorMessage || 'iPay initiation failed.');
+                }
+            case 'dpo':
+                const dpoResult = await initiateDpoPayment(newOrder, buyerDetails);
+                if (dpoResult.redirectUrl) {
+                    initiationDetails.provider_ref = dpoResult.transToken; // Store DPO transaction token
+                    initiationDetails.description = `DPO Group payment initiated. Redirect user to payment page.`;
+                    res.status(201).json({
+                        order: newOrder,
+                        payment_status: 'pending_redirect',
+                        transaction_id: initialTransaction.id,
+                        redirectUrl: dpoResult.redirectUrl
+                    });
+                    return;
+                } else {
+                    throw new Error(dpoResult.errorMessage || 'DPO Group initiation failed.');
+                }
+            case 'jambopay':
+                const jamboResult = await initiateJambopayPayment(newOrder, buyerDetails);
+                 if (jamboResult.redirectUrl) { // Assuming JamboPay provides a redirect URL
+                    initiationDetails.description = `JamboPay payment initiated. Redirect user to payment page.`;
+                    res.status(201).json({
+                        order: newOrder,
+                        payment_status: 'pending_redirect',
+                        transaction_id: initialTransaction.id,
+                        redirectUrl: jamboResult.redirectUrl
+                    });
+                    return;
+                } else {
+                    throw new Error(jamboResult.errorMessage || 'JamboPay initiation failed.');
+                }
             default:
                 throw new Error('Invalid payment method for initiation.');
         }
 
         await updateTransactionDetails(initialTransaction.id!, 'pending', initiationDetails);
 
-        // --- Send Notification to Seller --- 
-        const sellerNotification = `New Order #${newOrder.id} created by buyer ${buyer.id}. Item: ${item_description}. Amount: KES ${amount}. Awaiting payment via ${payment_method}.`;
-        sendSmsNotification(seller_id, sellerNotification);
+        // --- Send Notification to Seller ---
+        // Use buyerDetails for name/email as buyer object from req.user might be minimal
+        const buyerNameOrEmail = buyerDetails.full_name || buyerDetails.email;
+        const sellerNotification = `New Order #${newOrder.id} created by buyer ${buyerNameOrEmail}. Item: ${item_description}. Amount: KES ${amount}. Awaiting payment via ${payment_method}.`;
+        // Use seller's phone if available for SMS, otherwise consider email fallback
+        if (seller.phone_number) {
+            sendSmsNotification(seller.phone_number, sellerNotification);
+        } else {
+            console.warn(`Seller ${seller.id} (${seller.email}) does not have a phone number for SMS notification.`);
+        }
 
         res.status(201).json({ order: newOrder, payment_status: 'initiated', transaction_id: initialTransaction.id });
 
@@ -98,10 +226,13 @@ export const createNewOrder = async (req: Request, res: Response): Promise<void>
         const responsePayload = {
             message: 'Failed to create order or initiate payment.',
             error: error.message,
-            order: newOrder,
             payment_status: 'failed'
         };
-        res.status(500).json(responsePayload);
+        if (error.message.includes('not found') || error.message.includes('missing') || error.message.includes('not registered')) {
+            res.status(400).json(responsePayload);
+        } else {
+            res.status(500).json(responsePayload);
+        }
     }
 };
 
@@ -158,7 +289,7 @@ export const getUserOrders = async (req: Request, res: Response): Promise<void> 
     }
 
     try {
-        let orders = [];
+        let orders: Order[] = [];
         if (user.role === 'buyer' || user.role === 'seller') {
             orders = await findOrdersByUserId(user.id!, user.role);
         } else if (user.role === 'business') {
@@ -208,6 +339,9 @@ export const confirmOrderDelivery = async (req: Request, res: Response): Promise
             throw new Error('Failed to update order status to completed.');
         }
 
+        // Find seller details to notify
+        const seller = await findUserById(order.seller_id);
+
         try {
             console.log(`Initiating fund release for order ${orderId} to seller ${order.seller_id}...`);
             console.warn('Fund release logic not implemented yet.');
@@ -221,9 +355,13 @@ export const confirmOrderDelivery = async (req: Request, res: Response): Promise
                 description: `Buyer confirmed delivery. Funds released/release initiated for seller ${order.seller_id}.`
             });
 
-            // --- Send Notification to Seller --- 
+            // --- Send Notification to Seller ---
             const sellerNotification = `Buyer has confirmed delivery for Order #${orderId}. Funds (KES ${order.amount}) have been released or are being processed.`;
-            sendSmsNotification(order.seller_id, sellerNotification);
+            if (seller?.phone_number) {
+                sendSmsNotification(seller.phone_number, sellerNotification);
+            } else {
+                console.warn(`Seller ${order.seller_id} has no phone number for delivery confirmation SMS.`);
+            }
 
         } catch (releaseError: any) {
             console.error(`Fund release failed for order ${orderId}:`, releaseError);
@@ -236,14 +374,18 @@ export const confirmOrderDelivery = async (req: Request, res: Response): Promise
                 description: `Fund release failed: ${releaseError.message}`
             });
 
-            // --- Send Notification to Seller (about failure) --- 
+            // --- Send Notification to Seller (about failure) ---
             const sellerFailureNotification = `Buyer confirmed delivery for Order #${orderId}, but automated fund release failed. Please contact support.`;
-            sendSmsNotification(order.seller_id, sellerFailureNotification);
+            if (seller?.phone_number) {
+                sendSmsNotification(seller.phone_number, sellerFailureNotification);
+            } else {
+                console.warn(`Seller ${order.seller_id} has no phone number for fund release failure SMS.`);
+            }
 
-            res.status(200).json({ 
-                order: updatedOrder, 
-                release_status: 'failed', 
-                message: 'Delivery confirmed, but automated fund release failed. Admin notified.' 
+            res.status(200).json({
+                order: updatedOrder,
+                release_status: 'failed',
+                message: 'Delivery confirmed, but automated fund release failed. Admin notified.'
             });
             return;
         }
@@ -311,19 +453,30 @@ export const raiseOrderDispute = async (req: Request, res: Response): Promise<vo
             description: `Dispute raised by ${user.role} (ID: ${user.id}). Reason: ${reason}`
         });
 
-        // --- Send Notification to the other party --- 
+        // --- Send Notification to the other party ---
         let partyToNotifyId: number;
+        let partyToNotifyPhone: string | undefined;
         let notificationMessage: string;
+
         if (user.id === order.buyer_id) {
             // Buyer raised dispute, notify seller
             partyToNotifyId = order.seller_id;
+            const seller = await findUserById(partyToNotifyId);
+            partyToNotifyPhone = seller?.phone_number;
             notificationMessage = `Dispute raised by the buyer for Order #${orderId}. Reason: ${reason}. Please check your dashboard.`;
         } else {
             // Seller raised dispute, notify buyer
             partyToNotifyId = order.buyer_id;
+            const buyer = await findUserById(partyToNotifyId);
+            partyToNotifyPhone = buyer?.phone_number;
             notificationMessage = `Dispute raised by the seller for Order #${orderId}. Reason: ${reason}. Please check your dashboard.`;
         }
-        sendSmsNotification(partyToNotifyId, notificationMessage);
+
+        if (partyToNotifyPhone) {
+            sendSmsNotification(partyToNotifyPhone, notificationMessage);
+        } else {
+            console.warn(`User ${partyToNotifyId} has no phone number for dispute notification SMS.`);
+        }
 
         res.status(200).json(updatedOrder);
 
@@ -379,9 +532,14 @@ export const markOrderAsShipped = async (req: Request, res: Response): Promise<v
             description: `Order marked as shipped by seller.${proof_of_delivery_url ? ' Proof provided.' : ''}`
         });
 
-        // --- Send Notification to Buyer --- 
+        // --- Send Notification to Buyer ---
+        const buyer = await findUserById(order.buyer_id);
         const buyerNotification = `Your Order #${orderId} has been shipped by the seller${proof_of_delivery_url ? ' (proof available)' : ''}. Please confirm delivery upon receipt.`;
-        sendSmsNotification(order.buyer_id, buyerNotification);
+        if (buyer?.phone_number) {
+            sendSmsNotification(buyer.phone_number, buyerNotification);
+        } else {
+            console.warn(`Buyer ${order.buyer_id} has no phone number for shipment notification SMS.`);
+        }
 
         res.status(200).json(updatedOrder);
 

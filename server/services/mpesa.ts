@@ -1,10 +1,14 @@
-import axios, { AxiosError } from 'axios';
+import axios from 'axios';
 import { Buffer } from 'buffer';
-import { mpesaConfig } from '../../config/providers';
+import { mpesaConfig as importedMpesaConfig } from '../../config/providers';
 import { format } from 'date-fns'; // Using date-fns for timestamp formatting
 import { findTransactionByProviderRef, updateTransactionDetails, TransactionStatus, createTransaction } from '../models/Transaction'; // Import transaction models
 import { findOrderById, updateOrderStatus, OrderStatus } from '../models/Order'; // Import order models
 import { sendSmsNotification } from './notificationService'; // Import notification service
+import { findUserById } from '../models/User'; // Import findUserById for user lookups
+
+// Explicitly type mpesaConfig to include reversal properties
+const mpesaConfig: typeof importedMpesaConfig = importedMpesaConfig;
 
 // Define interfaces for expected M-Pesa responses for better type safety
 interface MpesaTokenResponse {
@@ -34,22 +38,25 @@ interface MpesaErrorResponse {
 }
 
 // Interface for the B2C Result callback structure
-interface MpesaB2CResultCallback {
+export interface MpesaB2CResultCallback {
     Result: {
         ResultType: number;
         ResultCode: number;
         ResultDesc: string;
         OriginatorConversationID: string;
         ConversationID: string;
-        TransactionID: string; // M-Pesa Transaction Receipt
+        TransactionID?: string;
         ResultParameters?: {
-            ResultParameter?: (
-                | { Key: string; Value: string | number; }
-                | { Key: string; Value: string | number; }[] // Can be array or single object
-            );
+            ResultParameter: Array<{
+                Key: string;
+                Value: string | number;
+            }>;
         };
         ReferenceData?: {
-            ReferenceItem: { Key: string; Value: string; };
+            ReferenceItem: {
+                Key: string;
+                Value: string;
+            };
         };
     };
 }
@@ -57,6 +64,27 @@ interface MpesaB2CResultCallback {
 // Interface for the B2C Timeout callback structure (Simplified - confirm exact structure if needed)
 interface MpesaB2CTimeoutCallback {
     OriginatorConversationID?: string; // Assuming controller might extract this if present
+}
+
+// Interface for Reversal Result callback
+export interface MpesaReversalResultCallback {
+    Result: {
+        ResultType: number;
+        ResultCode: number;
+        ResultDesc: string;
+        OriginatorConversationID: string;
+        ConversationID: string;
+        TransactionID: string; // Original Transaction ID that was reversed
+        ResultParameters?: {
+            ResultParameter?: (
+                | { Key: string; Value: string | number; }
+                | { Key: string; Value: string | number; }[]
+            );
+        };
+        ReferenceData?: {
+            ReferenceItem: { Key: string; Value: string; };
+        };
+    };
 }
 
 // Determine API base URL based on environment
@@ -86,10 +114,17 @@ export const getMpesaToken = async (): Promise<string> => {
             throw new Error('M-Pesa token generation failed: Invalid response format.');
         }
     } catch (error: any) {
-        const axiosError = error as AxiosError<MpesaErrorResponse>;
-        const errorData = axiosError.response?.data;
-        console.error('Error getting M-Pesa token:', errorData || axiosError.message);
-        throw new Error(`M-Pesa token generation failed: ${errorData?.errorMessage || axiosError.message}`);
+        // Check if it looks like an AxiosError
+        if (error && error.response) {
+            const axiosError = error; // Cast to AxiosError
+            const errorData = axiosError.response?.data;
+            console.error('Error getting M-Pesa token:', errorData || axiosError.message);
+            throw new Error(`M-Pesa token generation failed: ${errorData?.errorMessage || axiosError.message}`);
+        } else {
+            // Handle non-Axios errors
+            console.error('Error getting M-Pesa token (Non-Axios):', error);
+            throw new Error(`M-Pesa token generation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
     }
 };
 
@@ -148,12 +183,18 @@ export const initiateStkPush = async (orderId: number, phoneNumber: string, amou
         }
 
     } catch (error: any) {
-        const axiosError = error as AxiosError<MpesaErrorResponse>;
-        const errorData = axiosError.response?.data;
-        console.error(`Error initiating STK Push for Order ${orderId}:`, errorData || axiosError.message);
-        // Rethrow a more specific error
-        const errorMessage = errorData?.errorMessage || axiosError.message;
-        throw new Error(`STK Push failed: ${errorMessage}`);
+        // Check if it looks like an AxiosError
+        if (error && error.response) {
+            const axiosError = error; // Cast to AxiosError
+            const errorData = axiosError.response?.data;
+            console.error(`Error initiating STK Push for Order ${orderId}:`, errorData || axiosError.message);
+            const errorMessage = errorData?.errorMessage || axiosError.message;
+            throw new Error(`STK Push failed: ${errorMessage}`);
+        } else {
+            // Handle non-Axios errors
+            console.error(`Error initiating STK Push for Order ${orderId} (Non-Axios):`, error);
+            throw new Error(`STK Push failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
     }
 };
 
@@ -223,11 +264,18 @@ export const initiateB2CPayment = async (
         }
 
     } catch (error: any) {
-        const axiosError = error as AxiosError<MpesaErrorResponse>;
-        const errorData = axiosError.response?.data;
-        console.error(`Error initiating B2C payment:`, errorData || axiosError.message);
-        const errorMessage = errorData?.errorMessage || axiosError.message;
-        throw new Error(`B2C initiation failed: ${errorMessage}`);
+        // Check if it looks like an AxiosError
+        if (error && error.response) {
+            const axiosError = error; // Cast to AxiosError
+            const errorData = axiosError.response?.data;
+            console.error(`Error initiating B2C payment:`, errorData || axiosError.message);
+            const errorMessage = errorData?.errorMessage || axiosError.message;
+            throw new Error(`B2C initiation failed: ${errorMessage}`);
+        } else {
+            // Handle non-Axios errors
+            console.error(`Error initiating B2C payment (Non-Axios):`, error);
+            throw new Error(`B2C initiation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
     }
 };
 
@@ -263,14 +311,12 @@ export const handleB2CResult = async (callbackData: MpesaB2CResultCallback): Pro
     let newOrderStatus: OrderStatus | null = null;
     let updateDescription = ResultDesc;
     let providerReceipt: string | undefined = TransactionID;
-    let providerTimestamp: string | undefined;
 
     const params = Result.ResultParameters?.ResultParameter;
     let transactionDetails: { [key: string]: string | number } = {};
     if (params) {
         const paramsArray = Array.isArray(params) ? params : [params];
         paramsArray.forEach(p => { transactionDetails[p.Key] = p.Value; });
-        providerTimestamp = transactionDetails['TransactionCompletedDateTime'] as string;
     }
 
     if (ResultCode === 0) {
@@ -287,8 +333,7 @@ export const handleB2CResult = async (callbackData: MpesaB2CResultCallback): Pro
 
     try {
         await updateTransactionDetails(transaction.id!, newStatus, {
-            provider_receipt: providerReceipt,
-            provider_timestamp: providerTimestamp,
+            provider_ref: providerReceipt,
             description: updateDescription,
         });
         console.log(`Transaction ${transaction.id} updated to status: ${newStatus}`);
@@ -397,4 +442,207 @@ export const handleMpesaTimeout = async (checkoutRequestId: string): Promise<voi
 export const queryMpesaTransactionStatus = async (checkoutRequestId: string): Promise<any> => {
     console.warn(`TODO: Implement M-Pesa Transaction Status Query API call for CheckoutRequestID: ${checkoutRequestId}`);
     return Promise.resolve({ ResultCode: -1, ResultDesc: "Status query not implemented" }); 
+};
+
+/**
+ * Initiates an M-Pesa Transaction Reversal.
+ * Used for refunding a customer after a dispute resolution.
+ * NOTE: Requires the original successful M-Pesa Transaction ID.
+ * @param {string} transactionID - The M-Pesa Transaction ID of the original payment to be reversed.
+ * @param {number} amount - The amount to be reversed (should match the original transaction).
+ * @param {string} remarks - Remarks for the reversal (e.g., "Refund for Order #123").
+ * @param {string} occasion - Occasion for the reversal (optional).
+ * @returns {Promise<any>} The response from the M-Pesa Reversal API (structure might vary).
+ */
+export const initiateMpesaReversal = async (
+    transactionID: string,
+    amount: number,
+    remarks: string,
+    occasion: string = 'OrenPay Refund'
+): Promise<any> => { // Use 'any' for now, replace with specific interface if known
+    const token = await getMpesaToken();
+
+    if (!mpesaConfig.reversalSecurityCredential) { // Assuming a separate credential might be needed
+        console.error('FATAL: M-Pesa Reversal Security Credential is not configured in .env');
+        throw new Error('M-Pesa Reversal Security Credential not configured.');
+    }
+    if (!mpesaConfig.reversalResultURL || !mpesaConfig.reversalTimeoutURL) {
+        console.error('FATAL: M-Pesa Reversal callback URLs are not configured in .env');
+        throw new Error('M-Pesa Reversal callback URLs not configured.');
+    }
+
+    const payload = {
+        Initiator: mpesaConfig.b2cInitiatorName, // Often the same initiator as B2C
+        SecurityCredential: mpesaConfig.reversalSecurityCredential,
+        CommandID: 'TransactionReversal', // Standard CommandID for reversals
+        TransactionID: transactionID, // The original M-Pesa transaction ID to reverse
+        Amount: Math.round(amount),
+        ReceiverParty: mpesaConfig.shortcode, // Your shortcode
+        RecieverIdentifierType: '11', // Type for Shortcode (adjust if reversing to phone)
+        ResultURL: mpesaConfig.reversalResultURL,
+        QueueTimeOutURL: mpesaConfig.reversalTimeoutURL,
+        Remarks: remarks,
+        Occasion: occasion
+    };
+
+    try {
+        console.log(`Initiating M-Pesa Reversal for TransactionID: ${transactionID}, Amount: ${amount}`);
+        const response = await axios.post<any>(`${MPESA_API_BASE_URL}/mpesa/reversal/v1/request`, payload, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        console.log(`Reversal initiated. Response:`, response.data);
+        // Check M-Pesa response code for immediate success/failure indication
+        // Assuming '0' indicates successful acceptance for processing
+        if (response.data && response.data.ResponseCode === '0') {
+            return response.data; // Contains OriginatorConversationID
+        } else {
+            throw new Error(`Reversal initiation failed: ${response.data.ResponseDescription || 'Unknown M-Pesa error'}`);
+        }
+
+    } catch (error: any) {
+        if (error && error.response) {
+            const axiosError = error;
+            const errorData = axiosError.response?.data;
+            console.error(`Error initiating M-Pesa Reversal:`, errorData || axiosError.message);
+            const errorMessage = errorData?.errorMessage || errorData?.ResponseDescription || axiosError.message;
+            throw new Error(`Reversal initiation failed: ${errorMessage}`);
+        } else {
+            console.error(`Error initiating M-Pesa Reversal (Non-Axios):`, error);
+            throw new Error(`Reversal initiation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+};
+
+/**
+ * Handles the M-Pesa Reversal Result callback.
+ * Updates transaction and order status based on the refund result.
+ * @param callbackData - The parsed JSON data from the M-Pesa callback.
+ */
+export const handleReversalResult = async (callbackData: MpesaReversalResultCallback): Promise<void> => {
+    console.log('Handling M-Pesa Reversal Result Callback:', JSON.stringify(callbackData, null, 2));
+
+    const { Result } = callbackData;
+    if (!Result) {
+        console.error('Invalid Reversal Result callback format: Missing Result object.');
+        return;
+    }
+
+    const { OriginatorConversationID, ResultCode, ResultDesc, TransactionID } = Result;
+
+    // Find the reversal transaction log using the OriginatorConversationID
+    const transaction = await findTransactionByProviderRef(OriginatorConversationID, 'mpesa_reversal');
+
+    if (!transaction) {
+        console.error(`Reversal Result Callback: Original transaction log not found for OriginatorConversationID: ${OriginatorConversationID}`);
+        return;
+    }
+
+    if (transaction.status === 'success' || transaction.status === 'failed') {
+        console.warn(`Reversal Result Callback: Transaction ${transaction.id} already processed with status ${transaction.status}. Ignoring.`);
+        return;
+    }
+
+    let newStatus: TransactionStatus;
+    let newOrderStatus: OrderStatus | null = null;
+    let updateDescription = ResultDesc;
+    // Note: Reversal callbacks might not provide a new unique receipt. Use the original TxID for reference.
+    let providerReceipt: string | undefined = TransactionID; // Original TxID
+
+    if (ResultCode === 0) {
+        console.log(`M-Pesa Reversal Successful for OriginatorConversationID: ${OriginatorConversationID}, Original TransactionID: ${TransactionID}`);
+        newStatus = 'success'; // The *reversal* transaction was successful
+        newOrderStatus = 'refunded'; // Update order status to refunded
+        updateDescription = `Refund successful (Reversal). Original M-Pesa TxID: ${TransactionID}. ${ResultDesc}`;
+    } else {
+        console.error(`M-Pesa Reversal Failed for OriginatorConversationID: ${OriginatorConversationID}. ResultCode: ${ResultCode}, Desc: ${ResultDesc}`);
+        newStatus = 'failed'; // The *reversal* transaction failed
+        newOrderStatus = 'refund_failed'; // Update order status to refund_failed
+        updateDescription = `Refund failed (Reversal). Reason: ${ResultDesc} (Code: ${ResultCode})`;
+    }
+
+    try {
+        await updateTransactionDetails(transaction.id!, newStatus, {
+            provider_ref: providerReceipt, // Store original TxID here for reference
+            description: updateDescription,
+            provider_status_code: ResultCode.toString(),
+            provider_status_desc: ResultDesc,
+            // No new provider_transaction_id for reversal itself usually
+        });
+        console.log(`Transaction ${transaction.id} (Reversal) updated to status: ${newStatus}`);
+
+        if (newOrderStatus) {
+            await updateOrderStatus(transaction.order_id, newOrderStatus);
+            console.log(`Order ${transaction.order_id} status updated to: ${newOrderStatus}`);
+            // Send notifications about final refund status
+            const order = await findOrderById(transaction.order_id);
+            if (order) {
+                const buyer = await findUserById(order.buyer_id);
+                const seller = await findUserById(order.seller_id);
+                if (newOrderStatus === 'refunded') {
+                    if (buyer?.phone_number) sendSmsNotification(buyer.phone_number, `Your refund for Order #${order.id} (KES ${order.amount}) was successful.`);
+                    if (seller?.phone_number) sendSmsNotification(seller.phone_number, `The refund for Order #${order.id} has been successfully processed.`);
+                } else { // refund_failed
+                    if (buyer?.phone_number) sendSmsNotification(buyer.phone_number, `Your refund attempt for Order #${order.id} failed. Reason: ${ResultDesc}. Please contact support.`);
+                    if (seller?.phone_number) sendSmsNotification(seller.phone_number, `The refund attempt for Order #${order.id} failed. Please contact support if needed.`);
+                }
+            }
+        }
+
+    } catch (error) {
+        console.error(`Error updating database after Reversal Result callback for OriginatorConversationID ${OriginatorConversationID}:`, error);
+    }
+};
+
+/**
+ * Handles the M-Pesa Reversal Queue Timeout callback.
+ * Marks the reversal transaction as failed if it hasn't been processed yet.
+ * @param originatorConversationID - The OriginatorConversationID for the timed-out request.
+ */
+export const handleReversalTimeout = async (originatorConversationID: string): Promise<void> => {
+    console.log(`Handling M-Pesa Reversal Timeout for OriginatorConversationID: ${originatorConversationID}`);
+
+    if (!originatorConversationID) {
+        console.error('Reversal Timeout Callback: Missing OriginatorConversationID.');
+        return;
+    }
+
+    const transaction = await findTransactionByProviderRef(originatorConversationID, 'mpesa_reversal');
+
+    if (!transaction) {
+        console.error(`Reversal Timeout Callback: Original transaction log not found for OriginatorConversationID: ${originatorConversationID}`);
+        return;
+    }
+
+    if (transaction.status === 'pending') {
+        console.warn(`M-Pesa Reversal Timed Out for OriginatorConversationID: ${originatorConversationID}. Marking as failed.`);
+        const newStatus: TransactionStatus = 'failed';
+        const newOrderStatus: OrderStatus = 'refund_failed';
+        const updateDescription = 'Refund (Reversal) timed out waiting for response from M-Pesa.';
+
+        try {
+            await updateTransactionDetails(transaction.id!, newStatus, { description: updateDescription });
+            console.log(`Transaction ${transaction.id} (Reversal) updated to status: ${newStatus} due to timeout.`);
+
+            await updateOrderStatus(transaction.order_id, newOrderStatus);
+            console.log(`Order ${transaction.order_id} status updated to: ${newOrderStatus} due to reversal timeout.`);
+
+            // Send notifications about timeout failure
+            const order = await findOrderById(transaction.order_id);
+            if (order) {
+                const buyer = await findUserById(order.buyer_id);
+                const seller = await findUserById(order.seller_id);
+                if (buyer?.phone_number) sendSmsNotification(buyer.phone_number, `Your refund attempt for Order #${order.id} timed out. Please contact support.`);
+                if (seller?.phone_number) sendSmsNotification(seller.phone_number, `The refund attempt for Order #${order.id} timed out. Please contact support if needed.`);
+            }
+
+        } catch (error) {
+            console.error(`Error updating database after Reversal Timeout callback for OriginatorConversationID ${originatorConversationID}:`, error);
+        }
+    } else {
+        console.log(`Reversal Timeout Callback: Transaction ${transaction.id} already has status ${transaction.status}. Ignoring timeout.`);
+    }
 };

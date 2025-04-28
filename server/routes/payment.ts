@@ -15,6 +15,11 @@ import {
     validateAirtelWebhook,
     validateEquityWebhook
 } from '../middleware/webhookMiddleware';
+import { handlePesapalCallback } from '../controllers/paymentController'; // Import Pesapal handler
+import { handleTkashCallback } from '../services/tkash'; // Import T-Kash handler
+import { handleIpayWebhook } from '../services/ipay'; // Import iPay handler
+import { handleDpoWebhook } from '../services/dpo'; // Import DPO handler
+import { handleJambopayWebhook } from '../services/jambopay'; // Import JamboPay handler
 
 const router = express.Router();
 
@@ -35,10 +40,16 @@ router.post('/mpesa/timeout/:orderId', validateMpesaWebhook, mpesaTimeoutHandler
 router.post('/mpesa/b2c/result', validateMpesaWebhook, mpesaB2CResultHandler); 
 router.post('/mpesa/b2c/timeout', validateMpesaWebhook, mpesaB2CTimeoutHandler);
 
-// Airtel Callback
-router.post('/airtel/callback', validateAirtelWebhook, airtelCallbackHandler); // Define your callback URL in Airtel Dev Portal
+// Airtel Money Callbacks
+// Note: Ensure this path matches exactly what's configured in the Airtel portal
+router.post('/airtel/callback', validateAirtelWebhook, airtelCallbackHandler);
 
-// Equity Callback
-router.post('/equity/callback', validateEquityWebhook, equityCallbackHandler); // Define your callback URL in Equity Dev Portal
+// Equity Bank Callbacks
+// Note: Ensure this path matches exactly what's configured in the Equity portal
+router.post('/equity/callback', validateEquityWebhook, equityCallbackHandler);
+
+// Pesapal IPN
+// Note: Ensure this path matches exactly what's configured in the Pesapal portal
+router.get('/pesapal/callback', handlePesapalCallback); // Pesapal uses GET for IPN
 
 export default router;

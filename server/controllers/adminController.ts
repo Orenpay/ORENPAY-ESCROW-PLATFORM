@@ -1,10 +1,10 @@
 // server/controllers/adminController.ts
 import { Request, Response } from 'express';
-import { findOrderById, updateOrderStatus, findOrdersByStatus } from '../models/Order';
-import { createTransaction, updateTransactionDetails, findTransactionByProviderRef } from '../models/Transaction'; // Added findTransactionByProviderRef
+import { findOrderById, updateOrderStatus, findOrdersByStatus, OrderStatus, Order } from '../models/Order'; // Added OrderStatus and Order
+import { createTransaction, updateTransactionDetails, findTransactionByProviderRef, findTransactionsByOrderId } from '../models/Transaction'; // Added findTransactionsByOrderId
 import { sendSmsNotification } from '../services/notificationService';
-import { findUserById } from '../models/User'; // Added findUserById
-import { initiateB2CPayment } from '../services/mpesa'; // Added initiateB2CPayment
+import { findUserById } from '../models/User';
+import { initiateB2CPayment, initiateMpesaReversal } from '../services/mpesa'; // Added initiateMpesaReversal
 
 /**
  * Gets all orders currently in 'disputed' status.
@@ -26,7 +26,7 @@ export const getDisputedOrders = async (req: Request, res: Response): Promise<vo
  */
 export const resolveDisputeReleaseFunds = async (req: Request, res: Response): Promise<void> => {
     const orderId = parseInt(req.params.id, 10);
-    const adminUser = req.user;
+    const adminUser = req.user; // Populated by auth middleware
 
     if (isNaN(orderId)) {
         res.status(400).json({ message: 'Invalid order ID.' });
@@ -35,8 +35,10 @@ export const resolveDisputeReleaseFunds = async (req: Request, res: Response): P
 
     console.log(`Admin ${adminUser?.id} attempting to resolve dispute for Order ${orderId} by releasing funds.`);
 
+    let order; // Define order here to use in catch block if needed
+
     try {
-        const order = await findOrderById(orderId);
+        order = await findOrderById(orderId); // Assign to outer scope variable
         if (!order) {
             res.status(404).json({ message: 'Order not found.' });
             return;
@@ -47,15 +49,13 @@ export const resolveDisputeReleaseFunds = async (req: Request, res: Response): P
             return;
         }
 
-        // Fetch seller details for payout
         const seller = await findUserById(order.seller_id);
         if (!seller || !seller.phone_number) {
             console.error(`Seller ${order.seller_id} details or phone number not found for payout.`);
-            // Log this critical issue
             await createTransaction({
                 order_id: orderId,
                 user_id: adminUser!.id!,
-                provider: 'system',
+                provider: 'system_error',
                 amount: order.amount,
                 status: 'failed',
                 description: `Admin ${adminUser!.id!} attempted fund release, but seller phone number is missing.`
@@ -65,15 +65,17 @@ export const resolveDisputeReleaseFunds = async (req: Request, res: Response): P
         }
 
         let payoutInitiationResult: any;
-        let payoutStatus: 'processing' | 'failed' = 'failed';
-        let payoutDetails = 'Payout not attempted for this payment method.';
-        let finalOrderStatus: 'processing_payout' | 'disputed' | 'completed' = 'disputed'; // Default to disputed if payout fails
+        let payoutInitiationStatus: 'initiated' | 'failed' | 'skipped' = 'skipped';
+        let payoutInitiationDetails = 'Payout not attempted or not applicable for this payment method.';
+        let orderStatusAfterInitiation: OrderStatus = 'disputed'; // Default to keeping disputed
         let payoutTransactionProvider: string | null = null;
         let payoutTransactionRef: string | undefined = undefined;
+        let notificationMessageBuyer = '';
+        let notificationMessageSeller = '';
 
-        // --- Initiate Payout based on original payment method --- 
+        // --- Initiate Payout based on original payment method ---
         if (order.payment_method === 'mpesa') {
-            payoutTransactionProvider = 'mpesa_b2c'; // Specific provider for B2C
+            payoutTransactionProvider = 'mpesa_b2c';
             try {
                 console.log(`Initiating M-Pesa B2C payout for Order ${orderId} to seller ${seller.id} (${seller.phone_number})`);
                 payoutInitiationResult = await initiateB2CPayment(
@@ -82,95 +84,107 @@ export const resolveDisputeReleaseFunds = async (req: Request, res: Response): P
                     `Payout for Order #${orderId} (Dispute Resolved)`
                 );
 
-                // Check B2C initiation response
                 if (payoutInitiationResult && payoutInitiationResult.ResponseCode === '0') {
-                    payoutStatus = 'processing';
-                    finalOrderStatus = 'processing_payout'; // Update order status to reflect processing
+                    payoutInitiationStatus = 'initiated';
+                    orderStatusAfterInitiation = 'processing_payout'; // Set status to processing
                     payoutTransactionRef = payoutInitiationResult.OriginatorConversationID; // Store this ID
-                    payoutDetails = `M-Pesa B2C initiated. OriginatorConversationID: ${payoutTransactionRef}. Waiting for result callback.`;
-                    console.log(`M-Pesa B2C initiated successfully for Order ${orderId}. OriginatorConversationID: ${payoutTransactionRef}`);
+                    payoutInitiationDetails = `M-Pesa B2C initiated successfully. OriginatorConversationID: ${payoutTransactionRef}. Waiting for result callback.`;
+                    console.log(payoutInitiationDetails);
+
+                    notificationMessageSeller = `Admin resolved the dispute for Order #${orderId}. Funds (KES ${order.amount}) are being processed for release to your M-Pesa account. Ref: ${payoutTransactionRef}`;
+                    notificationMessageBuyer = `Admin resolved the dispute for Order #${orderId}. Funds are being processed for release to the seller.`;
+
                 } else {
-                    payoutStatus = 'failed';
-                    payoutDetails = `M-Pesa B2C initiation failed: ${payoutInitiationResult?.ResponseDescription || 'Unknown error'}`;
+                    payoutInitiationStatus = 'failed';
+                    orderStatusAfterInitiation = 'disputed'; // Keep disputed if initiation fails
+                    payoutInitiationDetails = `M-Pesa B2C initiation failed: ${payoutInitiationResult?.ResponseDescription || 'Unknown error'}`;
                     console.error(`M-Pesa B2C initiation failed for Order ${orderId}:`, payoutInitiationResult);
+
+                    notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId}, but M-Pesa payout initiation failed: ${payoutInitiationResult?.ResponseDescription || 'Unknown error'}. Please contact support.`;
+                    notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId}, but payout initiation failed. The order remains disputed. Please contact support.`;
                 }
             } catch (payoutError: any) {
-                payoutStatus = 'failed';
-                payoutDetails = `M-Pesa B2C initiation threw an error: ${payoutError.message}`;
+                payoutInitiationStatus = 'failed';
+                orderStatusAfterInitiation = 'disputed'; // Keep disputed on error
+                payoutInitiationDetails = `M-Pesa B2C initiation threw an error: ${payoutError.message}`;
                 console.error(`Error during M-Pesa B2C initiation for Order ${orderId}:`, payoutError);
+
+                notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId}, but an error occurred during M-Pesa payout initiation: ${payoutError.message}. Please contact support.`;
+                notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId}, but an error occurred during payout initiation. The order remains disputed. Please contact support.`;
             }
         } else if (order.payment_method === 'airtel') {
+            payoutTransactionProvider = 'airtel_payout';
+            payoutInitiationStatus = 'skipped';
+            orderStatusAfterInitiation = 'disputed';
+            payoutInitiationDetails = 'Airtel Money disbursement not implemented. Manual action required.';
             console.warn(`TODO: Implement Airtel Money disbursement for Order ${orderId}`);
-            payoutTransactionProvider = 'airtel_payout'; // Example
-            payoutDetails = 'Airtel Money disbursement not implemented.';
-            // Mark as failed since automated payout didn't happen
-            finalOrderStatus = 'disputed'; // Keep disputed until manually resolved
-            payoutStatus = 'failed'; // Log as failed because automated payout skipped/failed
+            notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId}, but automated Airtel payout is not yet implemented. Please contact support for manual release.`;
+            notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId}, but automated payout is not available for this method. The order remains disputed pending manual action.`;
         } else if (order.payment_method === 'equity') {
+            payoutTransactionProvider = 'equity_payout';
+            payoutInitiationStatus = 'skipped';
+            orderStatusAfterInitiation = 'disputed';
+            payoutInitiationDetails = 'Equity Bank payout not implemented. Manual action required.';
             console.warn(`TODO: Implement Equity Bank payout for Order ${orderId}`);
-            payoutTransactionProvider = 'equity_payout'; // Example
-            payoutDetails = 'Equity Bank payout not implemented.';
-            // Mark as failed since automated payout didn't happen
-            finalOrderStatus = 'disputed'; // Keep disputed until manually resolved
-            payoutStatus = 'failed'; // Log as failed because automated payout skipped/failed
+            notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId}, but automated Equity payout is not yet implemented. Please contact support for manual release.`;
+            notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId}, but automated payout is not available for this method. The order remains disputed pending manual action.`;
         } else {
-            // Unknown payment method - treat as manual/error
-            payoutStatus = 'failed';
-            payoutDetails = `Cannot process payout: Unknown payment method '${order.payment_method}'.`;
-            console.error(payoutDetails);
-            finalOrderStatus = 'disputed'; // Keep disputed
+            payoutTransactionProvider = `${order.payment_method}_payout`; // Generic provider name
+            payoutInitiationStatus = 'skipped';
+            orderStatusAfterInitiation = 'disputed';
+            payoutInitiationDetails = `Automated payout for '${order.payment_method}' not implemented. Manual action required.`;
+            console.warn(payoutInitiationDetails);
+            notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId}, but automated payout for ${order.payment_method} is not yet implemented. Please contact support for manual release.`;
+            notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId}, but automated payout is not available for this method. The order remains disputed pending manual action.`;
         }
 
-        // --- Update Order Status and Log Transaction --- 
-        let updatedOrder;
-        if (payoutStatus === 'processing') { // Only update status if payout is actively processing
-            updatedOrder = await updateOrderStatus(orderId, finalOrderStatus);
-        } else {
-            // Keep status as disputed if payout initiation failed or was skipped
-            updatedOrder = order; // Use the existing order data
-            finalOrderStatus = 'disputed';
+        let updatedOrder: Order | null = order; // Start with the original order data
+        if (order.status !== orderStatusAfterInitiation) {
+            updatedOrder = await updateOrderStatus(orderId, orderStatusAfterInitiation);
+            if (!updatedOrder) {
+                console.error(`CRITICAL: Failed to update order ${orderId} status to ${orderStatusAfterInitiation} after payout attempt.`);
+                updatedOrder = { ...order, status: orderStatusAfterInitiation };
+            }
         }
 
-        // Log the admin action and payout attempt
         await createTransaction({
             order_id: orderId,
             user_id: adminUser!.id!,
-            provider: payoutTransactionProvider || 'system', // Use specific provider if available
+            provider: payoutTransactionProvider || 'system',
             amount: order.amount,
-            // Use 'pending' if B2C initiated, 'failed' otherwise (covers skipped cases too)
-            status: payoutStatus === 'processing' ? 'pending' : 'failed', 
-            // Ensure provider_ref is string | undefined
-            provider_ref: payoutTransactionRef ?? undefined, 
-            description: `Admin ${adminUser!.id!} resolved dispute: Release funds. Payout status: ${payoutStatus}. Details: ${payoutDetails}`
+            status: payoutInitiationStatus === 'initiated' ? 'pending' : (payoutInitiationStatus === 'failed' ? 'failed' : 'skipped'),
+            provider_ref: payoutTransactionRef,
+            description: `Admin ${adminUser!.id!} resolved dispute: Release funds. Payout initiation status: ${payoutInitiationStatus}. Details: ${payoutInitiationDetails}`
         });
 
-        // --- Send Notifications --- 
-        if (payoutStatus === 'processing') {
-            // Notify seller that payout is processing
-            const sellerMessage = `Admin resolved the dispute for Order #${orderId}. Funds (KES ${order.amount}) are being processed for release to your M-Pesa account.`;
-            sendSmsNotification(order.seller_id, sellerMessage);
-            // Notify buyer that payout is processing
-            const buyerMessage = `Admin resolved the dispute for Order #${orderId}. Funds are being processed for release to the seller.`;
-            sendSmsNotification(order.buyer_id, buyerMessage);
-            res.status(200).json({ message: 'Dispute resolved. Payout processing initiated.', order: updatedOrder });
-        } else { // Covers payoutStatus === 'failed' (including skipped methods)
-            // Payout initiation failed or skipped
-            const adminMessage = `Failed to initiate/process payout for Order #${orderId} during dispute resolution. Reason: ${payoutDetails}`;
-            // TODO: Send notification to admin/support channel
-            console.error(adminMessage);
-
-            // Notify seller and buyer about the failure/issue
-            const sellerMessage = `Admin attempted to resolve the dispute for Order #${orderId}, but payout could not be automatically processed (${payoutDetails}). Please contact support.`;
-            sendSmsNotification(order.seller_id, sellerMessage);
-            const buyerMessage = `Admin attempted to resolve the dispute for Order #${orderId}, but payout could not be automatically processed. The order remains disputed. Please contact support.`;
-            sendSmsNotification(order.buyer_id, buyerMessage);
-
-            // Use 500 for actual errors, maybe 400/422 if it was expected (like non-implemented method)? Using 500 for now.
-            res.status(500).json({ message: 'Dispute resolution attempted, but automated payout failed or was not applicable.', order: updatedOrder });
+        const buyer = await findUserById(order.buyer_id);
+        if (buyer?.phone_number && notificationMessageBuyer) {
+            sendSmsNotification(buyer.phone_number, notificationMessageBuyer);
+        }
+        if (seller.phone_number && notificationMessageSeller) {
+            sendSmsNotification(seller.phone_number, notificationMessageSeller);
         }
 
-    } catch (error) {
-        console.error(`Error resolving dispute (release funds) for Order ${orderId}:`, error);
+        if (payoutInitiationStatus === 'initiated') {
+            res.status(200).json({ message: 'Dispute resolution initiated. Payout processing started.', order: updatedOrder });
+        } else if (payoutInitiationStatus === 'failed') {
+            res.status(500).json({ message: `Dispute resolution attempted, but payout initiation failed: ${payoutInitiationDetails}`, order: updatedOrder });
+        } else {
+            res.status(422).json({ message: `Dispute resolution attempted, but automated payout skipped: ${payoutInitiationDetails}`, order: updatedOrder });
+        }
+
+    } catch (error: any) {
+        console.error(`Error resolving dispute (release funds) for Order ${order?.id || orderId}:`, error);
+        if (order) {
+            await createTransaction({
+                order_id: order.id!,
+                user_id: adminUser?.id || 0,
+                provider: 'system_error',
+                amount: order.amount || 0,
+                status: 'failed',
+                description: `Unexpected error during dispute resolution (release funds): ${error.message}`
+            }).catch(logErr => console.error("Failed to log error transaction:", logErr));
+        }
         res.status(500).json({ message: 'Internal server error while resolving dispute.' });
     }
 };
@@ -178,6 +192,7 @@ export const resolveDisputeReleaseFunds = async (req: Request, res: Response): P
 /**
  * Allows an admin to resolve a dispute by refunding the buyer.
  * Requires admin privileges.
+ * NOTE: This needs significant work to implement actual refund provider APIs.
  */
 export const resolveDisputeRefundBuyer = async (req: Request, res: Response): Promise<void> => {
     const orderId = parseInt(req.params.id, 10);
@@ -190,68 +205,156 @@ export const resolveDisputeRefundBuyer = async (req: Request, res: Response): Pr
 
     console.log(`Admin ${adminUser?.id} attempting to resolve dispute for Order ${orderId} by refunding buyer.`);
 
+    let order; // Define order here for use in catch block
+
     try {
-        // 1. Fetch the order by ID.
-        const order = await findOrderById(orderId);
+        order = await findOrderById(orderId);
         if (!order) {
             res.status(404).json({ message: 'Order not found.' });
             return;
         }
 
-        // 2. Verify the order status is 'disputed'.
         if (order.status !== 'disputed') {
             res.status(400).json({ message: `Order status is '${order.status}', not 'disputed'. Cannot resolve.` });
             return;
         }
 
-        // 3. Implement the actual refund logic (calling payment service/API).
-        // WARNING: Actual refund processing is complex and provider-specific.
-        // This might involve reversal APIs or specific refund endpoints.
-        console.warn(`TODO: Implement actual refund for Order ${orderId} to Buyer ${order.buyer_id} via ${order.payment_method} API.`);
-        const refundSuccess = true; // Assume success for now
-
-        if (!refundSuccess) {
-            // Handle refund failure
-            console.error(`Refund failed for Order ${orderId}.`);
+        const buyer = await findUserById(order.buyer_id);
+        if (!buyer) {
+            console.error(`Buyer ${order.buyer_id} details not found for refund.`);
             await createTransaction({
                 order_id: orderId,
-                user_id: adminUser!.id!, // Admin user ID
-                provider: 'system',
+                user_id: adminUser!.id!,
+                provider: 'system_error',
                 amount: order.amount,
                 status: 'failed',
-                description: `Admin ${adminUser!.id!} attempted refund to buyer ${order.buyer_id}, but it failed.`
+                description: `Admin ${adminUser!.id!} attempted refund, but buyer details are missing.`
             });
-            res.status(500).json({ message: 'Refund process failed. Order status remains disputed.' });
+            res.status(500).json({ message: 'Cannot process refund: Buyer details missing.' });
             return;
         }
 
-        // 4. Update the order status to 'refunded'.
-        const updatedOrder = await updateOrderStatus(orderId, 'refunded');
-        if (!updatedOrder) {
-            throw new Error('Failed to update order status to refunded after dispute resolution.');
+        let refundInitiationStatus: 'initiated' | 'failed' | 'skipped' = 'skipped';
+        let refundInitiationDetails = 'Refund not attempted or not applicable for this payment method.';
+        let orderStatusAfterInitiation: OrderStatus = 'disputed'; // Default to keeping disputed
+        let refundTransactionProvider: string | null = null;
+        let refundTransactionRef: string | undefined = undefined;
+        let notificationMessageBuyer = '';
+        let notificationMessageSeller = '';
+
+        // --- Initiate Refund based on original payment method ---
+        if (order.payment_method === 'mpesa') {
+            refundTransactionProvider = 'mpesa_reversal';
+            try {
+                // Find the original successful M-Pesa payment transaction
+                const paymentTransactions = await findTransactionsByOrderId(orderId);
+                const originalPayment = paymentTransactions.find(
+                    tx => tx.provider === 'mpesa' && tx.status === 'success' && tx.provider_transaction_id
+                );
+
+                if (!originalPayment || !originalPayment.provider_transaction_id) {
+                    throw new Error('Original successful M-Pesa payment transaction ID not found.');
+                }
+
+                console.log(`Initiating M-Pesa Reversal for Order ${orderId}, Original TxID: ${originalPayment.provider_transaction_id}`);
+                const reversalResult = await initiateMpesaReversal(
+                    originalPayment.provider_transaction_id,
+                    order.amount,
+                    `Refund for Order #${orderId} (Dispute Resolved)`
+                );
+
+                // Check reversal initiation response
+                if (reversalResult && reversalResult.ResponseCode === '0') {
+                    refundInitiationStatus = 'initiated';
+                    orderStatusAfterInitiation = 'processing_refund'; // Set status to processing
+                    refundTransactionRef = reversalResult.OriginatorConversationID; // Store this ID
+                    refundInitiationDetails = `M-Pesa Reversal initiated successfully. OriginatorConversationID: ${refundTransactionRef}. Waiting for result callback.`;
+                    console.log(refundInitiationDetails);
+
+                    notificationMessageBuyer = `Admin resolved the dispute for Order #${orderId}. A refund (KES ${order.amount}) is being processed back to your M-Pesa account. Ref: ${refundTransactionRef}`;
+                    notificationMessageSeller = `Admin resolved the dispute for Order #${orderId} in favor of the buyer. A refund is being processed.`;
+                } else {
+                    refundInitiationStatus = 'failed';
+                    orderStatusAfterInitiation = 'disputed'; // Keep disputed if initiation fails
+                    refundInitiationDetails = `M-Pesa Reversal initiation failed: ${reversalResult?.ResponseDescription || 'Unknown error'}`;
+                    console.error(`M-Pesa Reversal initiation failed for Order ${orderId}:`, reversalResult);
+
+                    notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId} via refund, but M-Pesa reversal initiation failed: ${reversalResult?.ResponseDescription || 'Unknown error'}. Please contact support.`;
+                    notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId} via refund, but reversal initiation failed. The order remains disputed. Please contact support.`;
+                }
+
+            } catch (refundError: any) {
+                refundInitiationStatus = 'failed';
+                orderStatusAfterInitiation = 'disputed';
+                refundInitiationDetails = `Error during M-Pesa refund initiation attempt: ${refundError.message}`;
+                console.error(refundInitiationDetails);
+                notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId} via refund, but an error occurred: ${refundError.message}. Please contact support.`;
+                notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId} via refund, but an error occurred. The order remains disputed. Please contact support.`;
+            }
+
+        } else {
+            // Handle other payment methods - Assume manual/skipped
+            refundTransactionProvider = `${order.payment_method}_refund`;
+            refundInitiationStatus = 'skipped';
+            orderStatusAfterInitiation = 'disputed';
+            refundInitiationDetails = `Automated refund for '${order.payment_method}' not implemented. Manual action required.`;
+            console.warn(refundInitiationDetails);
+            notificationMessageBuyer = `Admin attempted to resolve the dispute for Order #${orderId} via refund, but automated refund for ${order.payment_method} is not yet implemented. Please contact support.`;
+            notificationMessageSeller = `Admin attempted to resolve the dispute for Order #${orderId} via refund, but automated refund is not available for this method. The order remains disputed pending manual action.`;
         }
 
-        // 5. Log the admin action in the transaction history.
+        // --- Update Order Status and Log Transaction ---
+        let updatedOrder: Order | null = order;
+        // Update DB only if the status needs changing
+        if (order.status !== orderStatusAfterInitiation) {
+            updatedOrder = await updateOrderStatus(orderId, orderStatusAfterInitiation);
+            if (!updatedOrder) {
+                console.error(`CRITICAL: Failed to update order ${orderId} status to ${orderStatusAfterInitiation} after refund attempt.`);
+                updatedOrder = { ...order, status: orderStatusAfterInitiation };
+            }
+        }
+
+        // Log the admin action and refund *initiation* attempt
         await createTransaction({
             order_id: orderId,
-            user_id: adminUser!.id!, // Admin user ID
-            provider: 'system',
-            amount: order.amount, // Log the amount refunded
-            status: 'refunded', // Use 'refunded' status for the transaction log
-            description: `Dispute resolved by admin ${adminUser!.id!}. Funds refunded to buyer ${order.buyer_id}.`
+            user_id: adminUser!.id!,
+            provider: refundTransactionProvider || 'system',
+            amount: order.amount, // Log the amount intended for refund
+            status: refundInitiationStatus === 'initiated' ? 'pending' : (refundInitiationStatus === 'failed' ? 'failed' : 'skipped'),
+            provider_ref: refundTransactionRef, // Store OriginatorConversationID if initiated
+            description: `Admin ${adminUser!.id!} resolved dispute: Refund buyer. Refund initiation status: ${refundInitiationStatus}. Details: ${refundInitiationDetails}`
         });
 
-        // 6. Notify buyer and seller.
-        const buyerMessage = `Admin resolved the dispute for Order #${orderId}. A refund of KES ${order.amount} has been processed to your account.`;
-        sendSmsNotification(order.buyer_id, buyerMessage);
+        // --- Send Notifications ---
+        if (buyer.phone_number && notificationMessageBuyer) {
+            sendSmsNotification(buyer.phone_number, notificationMessageBuyer);
+        }
+        const seller = await findUserById(order.seller_id);
+        if (seller?.phone_number && notificationMessageSeller) {
+            sendSmsNotification(seller.phone_number, notificationMessageSeller);
+        }
 
-        const sellerMessage = `Admin resolved the dispute for Order #${orderId} in favor of the buyer. Funds have been refunded.`;
-        sendSmsNotification(order.seller_id, sellerMessage);
+        // Respond to the admin API request based on initiation outcome
+        if (refundInitiationStatus === 'initiated') {
+            res.status(200).json({ message: 'Dispute resolution initiated. Refund processing started.', order: updatedOrder });
+        } else if (refundInitiationStatus === 'failed') {
+            res.status(500).json({ message: `Dispute resolution attempted (refund), but initiation failed: ${refundInitiationDetails}`, order: updatedOrder });
+        } else { // Skipped
+            res.status(422).json({ message: `Dispute resolution attempted (refund), but automated refund skipped: ${refundInitiationDetails}`, order: updatedOrder });
+        }
 
-        res.status(200).json({ message: 'Dispute resolved successfully. Funds refunded to buyer.', order: updatedOrder });
-
-    } catch (error) {
-        console.error(`Error resolving dispute (refund buyer) for Order ${orderId}:`, error);
+    } catch (error: any) {
+        console.error(`Error resolving dispute (refund buyer) for Order ${order?.id || orderId}:`, error);
+        if (order) {
+            await createTransaction({
+                order_id: order.id!,
+                user_id: adminUser?.id || 0,
+                provider: 'system_error',
+                amount: order.amount || 0,
+                status: 'failed',
+                description: `Unexpected error during dispute resolution (refund buyer): ${error.message}`
+            }).catch(logErr => console.error("Failed to log error transaction:", logErr));
+        }
         res.status(500).json({ message: 'Internal server error while resolving dispute.' });
     }
 };

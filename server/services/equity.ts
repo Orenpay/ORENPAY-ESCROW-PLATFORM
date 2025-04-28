@@ -128,3 +128,43 @@ export const handleEquityCallback = async (callbackData: any, queryParams: any):
     // });
     console.log(`Transaction log updated for Order ${orderId} (Equity). Status: ${transactionStatus}`);
 };
+
+/**
+ * Initiates an Equity Bank Payout (Disbursement).
+ * Placeholder - Not Implemented.
+ * @param {string} accountNumber - Recipient bank account number.
+ * @param {number} amount - Amount to send.
+ * @param {string} reference - Unique reference for the transaction.
+ * @param {string} remarks - Remarks for the transaction.
+ * @returns {Promise<any>} - Placeholder response.
+ */
+export const initiateEquityPayout = async (
+    accountNumber: string,
+    amount: number,
+    reference: string,
+    remarks: string
+): Promise<any> => {
+    console.warn(`TODO: Implement Equity Bank Payout API call for Account: ${accountNumber}, Amount: ${amount}, Ref: ${reference}`);
+    // Simulate skipping the process
+    throw new Error('Equity Bank Payout not implemented.');
+    // return { status: 'skipped', message: 'Equity Bank Payout not implemented.' };
+};
+
+/**
+ * Initiates an Equity Bank Refund (Reversal).
+ * Placeholder - Not Implemented.
+ * @param {string} originalTransactionId - The original transaction ID to refund.
+ * @param {number} amount - Amount to refund.
+ * @param {string} remarks - Remarks for the refund.
+ * @returns {Promise<any>} - Placeholder response.
+ */
+export const initiateEquityRefund = async (
+    originalTransactionId: string,
+    amount: number,
+    remarks: string
+): Promise<any> => {
+    console.warn(`TODO: Implement Equity Bank Refund API call for Original TxID: ${originalTransactionId}, Amount: ${amount}`);
+    // Simulate skipping the process
+    throw new Error('Equity Bank Refund not implemented.');
+    // return { status: 'skipped', message: 'Equity Bank Refund not implemented.' };
+};

@@ -6,20 +6,40 @@ import getDbPool from '../config/db'; // Import the function to get the pool
 import { createUsersTable } from '../server/models/User'; // Import the table creation function
 import { createOrdersTable } from '../server/models/Order'; // Import Order table creation
 import { createTransactionsTable } from '../server/models/Transaction'; // Import Transaction table creation
+// Import new model table creation functions
+import { createAgentsTable } from '../server/models/Agent';
+import { createShipmentsTable } from '../server/models/Shipment';
+import { createShipmentLegsTable } from '../server/models/ShipmentLeg';
 import authRoutes from '../server/routes/auth'; // Import authentication routes
 import orderRoutes from '../server/routes/order'; // Import order routes
 import adminRoutes from '../server/routes/admin'; // Import admin routes
 import paymentRoutes from '../server/routes/payment'; // Import payment routes
+// Import new route files - Corrected paths relative to src/
+import agentRoutes from '../server/routes/agent';
+import shipmentRoutes from '../server/routes/shipment';
 
 // Load environment variables first
 dotenv.config();
+
+// Define a type for requests that might have a rawBody
+interface RequestWithRawBody extends Request {
+    rawBody?: Buffer;
+}
 
 // Initialize Express app
 const app: Express = express();
 
 // Middleware
 app.use(cors()); // Enable CORS for all origins (adjust for production)
-app.use(express.json()); // Parse JSON request bodies
+
+// Use express.json() with a verify function to capture the raw body
+app.use(express.json({
+    verify: (req: RequestWithRawBody, res, buf, encoding) => {
+        if (buf && buf.length) {
+            req.rawBody = buf; // Attach raw body buffer to the request object
+        }
+    }
+}));
 
 const initializeDatabase = async () => {
     try {
@@ -30,8 +50,12 @@ const initializeDatabase = async () => {
 
         // Ensure all required tables exist
         await createUsersTable();
-        await createOrdersTable(); // Add this line
-        await createTransactionsTable(); // Add this line
+        await createOrdersTable();
+        await createTransactionsTable();
+        // Add calls for new tables
+        await createAgentsTable();
+        await createShipmentsTable();
+        await createShipmentLegsTable();
 
     } catch (error) {
         console.error('Failed to connect to the database or setup tables:', error);
@@ -55,6 +79,12 @@ app.use('/api/admin', adminRoutes);
 
 // Mount payment routes
 app.use('/api/payments', paymentRoutes);
+
+// Mount agent routes
+app.use('/api/agents', agentRoutes);
+
+// Mount shipment routes
+app.use('/api/shipments', shipmentRoutes);
 
 // --- Initialize DB and Start Server ---
 const startServer = async () => {

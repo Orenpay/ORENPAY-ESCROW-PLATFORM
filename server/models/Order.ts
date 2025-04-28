@@ -1,7 +1,7 @@
 import { Pool } from 'pg';
 import db from '../../config/db';
 
-export type OrderStatus = 'pending' | 'paid' | 'shipped' | 'delivered' | 'disputed' | 'completed' | 'cancelled' | 'refunded' | 'processing_payout';
+export type OrderStatus = 'pending' | 'paid' | 'shipped' | 'delivered' | 'disputed' | 'completed' | 'cancelled' | 'refunded' | 'processing_payout' | 'payout_failed' | 'processing_refund' | 'refund_failed';
 
 export interface Order {
     id?: number;
@@ -83,8 +83,21 @@ export const createOrdersTable = async () => {
           seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
           item_description TEXT NOT NULL,
           amount NUMERIC(12, 2) NOT NULL, -- Increased precision
-          status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'shipped', 'delivered', 'disputed', 'completed', 'cancelled', 'refunded', 'processing_payout')),
-          payment_method VARCHAR(20),
+          status VARCHAR(25) DEFAULT 'pending' CHECK (status IN (
+            'pending', 'paid', 'shipped', 'delivered', 'disputed', 
+            'completed', 'cancelled', 'refunded', 'processing_payout', 
+            'payout_failed', 'processing_refund', 'refund_failed' 
+          )),
+          payment_method VARCHAR(20) CHECK (payment_method IN (
+            'mpesa', 
+            'airtel', 
+            'equity', 
+            'pesapal', 
+            'tkash',       -- Added T-Kash
+            'ipay',        -- Added iPay
+            'dpo',         -- Added DPO Group
+            'jambopay'     -- Added JamboPay
+          )), 
           proof_of_delivery_url TEXT,
           created_at TIMESTAMP DEFAULT NOW()
           -- Consider adding updated_at TIMESTAMP
