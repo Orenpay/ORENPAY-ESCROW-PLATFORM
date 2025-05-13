@@ -1,6 +1,5 @@
 {
   "version": 2,
-  "rootDirectory": "client",
   "builds": [
     { "src": "client/package.json", "use": "@vercel/next" },
     { "src": "server/src/server.ts", "use": "@vercel/node" }
